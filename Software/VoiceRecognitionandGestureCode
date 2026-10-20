@@ -1,0 +1,324 @@
+"""
+robot_main.py  -  baseline script for the voice + gesture controlled robot.
+
+Runs two input methods at the same time:
+  * AI Camera (IMX500) pose estimation  -> hand-raise gestures
+  * USB microphone speech recognition   -> spoken commands
+
+Both feed ONE function, robot_do(), which is where the robot's real actions
+(L298N motors, ultrasonic sensor, etc.) will be added later. For now it only
+prints what the robot WOULD do, so you can test the inputs safely.
+
+Save this file in ~/picamera2-examples/examples/imx500/ and run it from Thonny
+on the Pi's desktop.
+"""
+import ctypes
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import cv2
+import numpy as np
+import speech_recognition as sr
+
+from picamera2 import CompletedRequest, MappedArray, Picamera2
+from picamera2.devices.imx500 import IMX500, NetworkIntrinsics
+from picamera2.devices.imx500.postprocess import COCODrawer
+from picamera2.devices.imx500.postprocess_highernet import postprocess_higherhrnet
+
+# ----------------------------------------------------------------------------
+# Hide the harmless ALSA warnings in Thonny's output
+# ----------------------------------------------------------------------------
+ERROR_HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                                 ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+
+
+def _silent(filename, line, function, err, fmt):
+    pass
+
+
+c_error_handler = ERROR_HANDLER(_silent)  # keep this reference alive, or Python frees it and crashes
+
+try:
+    ctypes.cdll.LoadLibrary("libasound.so.2").snd_lib_error_set_handler(c_error_handler)
+except OSError:
+    pass
+
+# ----------------------------------------------------------------------------
+# SETTINGS  (edit these)
+# ----------------------------------------------------------------------------
+MODEL = "/usr/share/imx500-models/imx500_network_higherhrnet_coco.rpk"
+DETECTION_THRESHOLD = 0.3   # pose detection confidence
+KP_MIN_SCORE = 0.3          # ignore keypoints the camera is unsure about
+MARGIN = 20                 # wrist must be this many pixels above the shoulder
+FRAMES_NEEDED = 3           # same gesture this many frames in a row to count
+SPEAK = True                # speak voice-command replies through the speaker
+WINDOW_SIZE_H_W = (480, 640)
+
+# (robot command, spoken reply, phrases that trigger it).
+# Short words like "left" and "back" are hard for speech recognition, so each command
+# has several phrases, including words it is commonly mistaken for.
+# Order matters: first match wins, so STOP is checked first for safety.
+VOICE_COMMANDS = [
+    ("STOP", "Stopping",
+     ("stop", "halt", "freeze", "stay")),
+    ("FORWARD", "Moving forward",
+     ("move front", "go front", "front", "move from", "move frond",
+      "forward", "go ahead", "move ahead", "foreword", "for word", "four word")),
+    ("BACKWARD", "Moving backward",
+     ("move back", "go back", "back", "backward", "reverse")),
+    ("TURN LEFT", "Turning left",
+     ("turn left", "go left", "left", "lift")),
+    ("TURN RIGHT", "Turning right",
+     ("turn right", "go right", "right", "write", "rite")),
+    ("STATUS", "System is running normally",
+     ("status", "report")),
+    ("HELLO", "Hello! The robot is ready",
+     ("hello", "hi robot")),
+]
+SHUTDOWN_PHRASES = ("shut down", "shutdown", "exit program")
+
+# Gesture -> robot command
+GESTURE_COMMANDS = {
+    "RIGHT HAND UP": "TURN RIGHT",
+    "LEFT HAND UP": "TURN LEFT",
+    "BOTH HANDS UP": "STOP",
+}
+
+# ----------------------------------------------------------------------------
+# SHARED ROBOT ACTION  (voice and gesture both call this)
+# ----------------------------------------------------------------------------
+action_lock = threading.Lock()
+last_command = "none"
+stop_event = threading.Event()
+
+
+def robot_do(command, source):
+    """Single place where the robot acts. Replace the print with real control later."""
+    global last_command
+    with action_lock:
+        last_command = command
+        print(f"[{source.upper()}] -> {command}", flush=True)
+
+        # TODO (later): add robot control here, for example:
+        #   FORWARD / BACKWARD / TURN LEFT / TURN RIGHT / STOP  -> L298N motor driver
+        #   check the ultrasonic sensor before moving forward
+
+
+# ----------------------------------------------------------------------------
+# GESTURE RECOGNITION (AI Camera)
+# ----------------------------------------------------------------------------
+last_boxes = None
+last_scores = None
+last_keypoints = None
+
+# COCO keypoint positions
+L_SHOULDER, R_SHOULDER = 5, 6
+L_WRIST, R_WRIST = 9, 10
+
+current_gesture = "none"
+candidate = "none"
+candidate_count = 0
+
+
+def classify_gesture(kp):
+    """kp is 17 keypoints for one person, each (x, y, score)."""
+    ls, rs = kp[L_SHOULDER], kp[R_SHOULDER]
+    lw, rw = kp[L_WRIST], kp[R_WRIST]
+    left_up = lw[2] > KP_MIN_SCORE and ls[2] > KP_MIN_SCORE and lw[1] < ls[1] - MARGIN
+    right_up = rw[2] > KP_MIN_SCORE and rs[2] > KP_MIN_SCORE and rw[1] < rs[1] - MARGIN
+    if left_up and right_up:
+        return "BOTH HANDS UP"
+    if right_up:
+        return "RIGHT HAND UP"
+    if left_up:
+        return "LEFT HAND UP"
+    return "none"
+
+
+def update_gesture(raw):
+    """Accept a gesture only once it is stable, then trigger its robot command."""
+    global current_gesture, candidate, candidate_count
+    if raw == candidate:
+        candidate_count += 1
+    else:
+        candidate, candidate_count = raw, 1
+    if candidate_count >= FRAMES_NEEDED and candidate != current_gesture:
+        current_gesture = candidate
+        if current_gesture in GESTURE_COMMANDS:
+            robot_do(GESTURE_COMMANDS[current_gesture], "gesture")
+
+
+def ai_output_tensor_parse(metadata: dict):
+    global last_boxes, last_scores, last_keypoints
+    np_outputs = imx500.get_outputs(metadata=metadata, add_batch=True)
+    if np_outputs is not None:
+        keypoints, scores, boxes = postprocess_higherhrnet(
+            outputs=np_outputs,
+            img_size=WINDOW_SIZE_H_W,
+            img_w_pad=(0, 0),
+            img_h_pad=(0, 0),
+            detection_threshold=DETECTION_THRESHOLD,
+            network_postprocess=True,
+        )
+        if scores is not None and len(scores) > 0:
+            last_keypoints = np.reshape(np.stack(keypoints, axis=0), (len(scores), 17, 3))
+            last_boxes = [np.array(b) for b in boxes]
+            last_scores = np.array(scores)
+        else:
+            last_keypoints = None
+            last_boxes = None
+            last_scores = None
+    return last_boxes, last_scores, last_keypoints
+
+
+def ai_output_tensor_draw(request: CompletedRequest, boxes, scores, keypoints, stream='main'):
+    with MappedArray(request, stream) as m:
+        if boxes is not None and len(boxes) > 0:
+            drawer.annotate_image(
+                m.array, boxes, scores, np.zeros(scores.shape), keypoints,
+                DETECTION_THRESHOLD, DETECTION_THRESHOLD,
+                request.get_metadata(), picam2, stream,
+            )
+        cv2.putText(m.array, "Gesture: " + current_gesture, (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0, 255), 2)
+        cv2.putText(m.array, "Last command: " + last_command, (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255, 255), 2)
+
+
+def picamera2_pre_callback(request: CompletedRequest):
+    boxes, scores, keypoints = ai_output_tensor_parse(request.get_metadata())
+    if keypoints is not None and scores is not None:
+        best = int(np.argmax(scores))       # use the most confident person
+        update_gesture(classify_gesture(keypoints[best]))
+    else:
+        update_gesture("none")
+    ai_output_tensor_draw(request, boxes, scores, keypoints)
+
+
+def get_drawer():
+    categories = intrinsics.labels
+    categories = [c for c in categories if c and c != "-"]
+    return COCODrawer(categories, imx500, needs_rescale_coords=False)
+
+
+# ----------------------------------------------------------------------------
+# VOICE COMMANDS (USB microphone)
+# ----------------------------------------------------------------------------
+def speak(text):
+    if SPEAK:
+        subprocess.run(["espeak-ng", text])
+        time.sleep(0.7)  # let speaker audio finish before listening again
+
+
+def match_command(text):
+    text = text.lower()
+    for command, reply, phrases in VOICE_COMMANDS:
+        if any(p in text for p in phrases):
+            return command, reply
+    return None
+
+
+def handle_voice(alternatives):
+    """alternatives: possible transcripts of what was heard, best guess first."""
+    for text in alternatives:
+        if any(p in text.lower() for p in SHUTDOWN_PHRASES):
+            print("[VOICE] -> SHUTDOWN")
+            speak("Shutting down. Goodbye")
+            stop_event.set()
+            return
+    for text in alternatives:
+        match = match_command(text)
+        if match:
+            command, reply = match
+            robot_do(command, "voice")
+            speak(reply)
+            return
+    print("[VOICE] Command not recognised.")
+
+
+def voice_loop():
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()  # if it picks the wrong mic, use sr.Microphone(device_index=N)
+
+    recognizer.pause_threshold = 0.6   # stop listening sooner after you finish speaking
+
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source, duration=2)
+    print("Voice ready. Try: 'move front', 'move back', 'turn left', 'turn right', 'stop'"
+          " | say 'shut down' to quit")
+
+    while not stop_event.is_set():
+        with mic as source:
+            try:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+            except sr.WaitTimeoutError:
+                continue
+        try:
+            result = recognizer.recognize_google(audio, show_all=True)
+        except sr.UnknownValueError:
+            print("Could not understand, try again.")
+            continue
+        except sr.RequestError as e:
+            print("Speech service error (check internet):", e)
+            continue
+
+        alternatives = []
+        if isinstance(result, dict):
+            alternatives = [a["transcript"] for a in result.get("alternative", []) if "transcript" in a]
+        if not alternatives:
+            print("Could not understand, try again.")
+            continue
+
+        print("Heard:", alternatives[0], "| other guesses:", alternatives[1:4])
+        handle_voice(alternatives)
+
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # The IMX500 must be created before Picamera2
+    imx500 = IMX500(MODEL)
+    intrinsics = imx500.network_intrinsics
+    if not intrinsics:
+        intrinsics = NetworkIntrinsics()
+        intrinsics.task = "pose estimation"
+    elif intrinsics.task != "pose estimation":
+        print("Network is not a pose estimation task", file=sys.stderr)
+        sys.exit(1)
+
+    if intrinsics.inference_rate is None:
+        intrinsics.inference_rate = 10
+    if intrinsics.labels is None:
+        labels_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "coco_labels.txt")
+        with open(labels_path, "r") as f:
+            intrinsics.labels = f.read().splitlines()
+    intrinsics.update_with_defaults()
+
+    drawer = get_drawer()
+
+    picam2 = Picamera2(imx500.camera_num)
+    config = picam2.create_preview_configuration(
+        controls={'FrameRate': intrinsics.inference_rate}, buffer_count=12)
+
+    imx500.show_network_fw_progress_bar()
+    picam2.start(config, show_preview=True)
+    imx500.set_auto_aspect_ratio()
+    picam2.pre_callback = picamera2_pre_callback
+
+    # Voice runs in the background while the camera keeps running
+    threading.Thread(target=voice_loop, daemon=True).start()
+
+    print("Robot baseline running. Press Thonny's Stop button or say 'shut down' to quit.")
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        picam2.stop()
+        print("Stopped.")
