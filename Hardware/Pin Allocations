@@ -9,4 +9,4 @@ Module 2 IN4 (rear-right)	GPIO26	37
 HC-SR04 TRIG	GPIO23	16
 HC-SR04 ECHO (through divider)	GPIO24	18
 HC-SR04 VCC	5V	2
-Ground	GND	6 and 9
+Ground	GND	6
