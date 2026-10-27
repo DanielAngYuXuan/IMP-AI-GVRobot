@@ -22,7 +22,7 @@ import time
 import cv2
 import numpy as np
 import speech_recognition as sr
-from gpiozero import DistanceSensor, Motor
+import lgpio
 
 from picamera2 import CompletedRequest, MappedArray, Picamera2
 from picamera2.devices.imx500 import IMX500, NetworkIntrinsics
@@ -61,6 +61,7 @@ WINDOW_SIZE_H_W = (480, 640)
 # --- Motors and ultrasonic sensor (GPIO numbers are BCM numbers, see wiring table) ---
 USE_MOTORS = True            # set False to test voice/gesture without any hardware connected
 USE_ULTRASONIC = False       # set True once the HC-SR04 sensor is wired up
+GPIO_CHIP = 15               # the "pinctrl-rp1" chip shown by the gpiodetect command
 # Two L298N modules, one motor per channel: module 1 = LEFT side, module 2 = RIGHT side
 FRONT_LEFT_PINS = (5, 6)       # module 1: IN1, IN2
 REAR_LEFT_PINS = (13, 19)      # module 1: IN3, IN4
@@ -113,20 +114,51 @@ stop_event = threading.Event()
 
 left_motors = []     # front-left and rear-left
 right_motors = []    # front-right and rear-right
-sensor = None
+gpio_handle = None
+sensor_ready = False
 stop_timer = None
 moving_forward = False
+PWM_FREQ = 200       # Hz, software PWM for speed control
+
+
+class Motor:
+    """One DC motor on two L298N input pins, controlled directly with lgpio."""
+
+    def __init__(self, forward, backward):
+        self.fwd = forward
+        self.back = backward
+        lgpio.gpio_claim_output(gpio_handle, self.fwd, 0)
+        lgpio.gpio_claim_output(gpio_handle, self.back, 0)
+
+    def _set(self, fwd_duty, back_duty):
+        lgpio.tx_pwm(gpio_handle, self.fwd, PWM_FREQ, fwd_duty)
+        lgpio.tx_pwm(gpio_handle, self.back, PWM_FREQ, back_duty)
+
+    def forward(self, speed=1.0):
+        self._set(speed * 100, 0)
+
+    def backward(self, speed=1.0):
+        self._set(0, speed * 100)
+
+    def stop(self):
+        self._set(0, 0)
+
+    def close(self):
+        self.stop()
+        lgpio.gpio_free(gpio_handle, self.fwd)
+        lgpio.gpio_free(gpio_handle, self.back)
 
 
 def setup_robot():
-    """Create the motor and distance-sensor objects."""
-    global left_motors, right_motors, sensor
-    left_motors = [Motor(forward=f, backward=b, pwm=True)
-                   for f, b in (FRONT_LEFT_PINS, REAR_LEFT_PINS)]
-    right_motors = [Motor(forward=f, backward=b, pwm=True)
-                    for f, b in (FRONT_RIGHT_PINS, REAR_RIGHT_PINS)]
+    """Open the GPIO chip and create the four motors (and the sensor pins if enabled)."""
+    global gpio_handle, left_motors, right_motors, sensor_ready
+    gpio_handle = lgpio.gpiochip_open(GPIO_CHIP)
+    left_motors = [Motor(f, b) for f, b in (FRONT_LEFT_PINS, REAR_LEFT_PINS)]
+    right_motors = [Motor(f, b) for f, b in (FRONT_RIGHT_PINS, REAR_RIGHT_PINS)]
     if USE_ULTRASONIC:
-        sensor = DistanceSensor(echo=ECHO_PIN, trigger=TRIG_PIN, max_distance=2.0)
+        lgpio.gpio_claim_output(gpio_handle, TRIG_PIN, 0)
+        lgpio.gpio_claim_input(gpio_handle, ECHO_PIN)
+        sensor_ready = True
 
 
 def set_side(motors, direction):
@@ -160,10 +192,27 @@ def drive(left, right, seconds):
         stop_timer.start()
 
 
+def read_distance_cm():
+    """Distance from the HC-SR04 in cm, or None if there is no valid reading."""
+    lgpio.gpio_write(gpio_handle, TRIG_PIN, 1)
+    time.sleep(0.00001)
+    lgpio.gpio_write(gpio_handle, TRIG_PIN, 0)
+    deadline = time.perf_counter() + 0.03
+    while lgpio.gpio_read(gpio_handle, ECHO_PIN) == 0:
+        if time.perf_counter() > deadline:
+            return None
+    start = time.perf_counter()
+    while lgpio.gpio_read(gpio_handle, ECHO_PIN) == 1:
+        if time.perf_counter() - start > 0.03:
+            return None
+    return (time.perf_counter() - start) * 34300 / 2
+
+
 def obstacle_close():
-    if sensor is None:
+    if not sensor_ready:
         return False
-    return sensor.distance * 100 < OBSTACLE_CM
+    distance = read_distance_cm()
+    return distance is not None and distance < OBSTACLE_CM
 
 
 def safety_loop():
@@ -180,9 +229,10 @@ def shutdown_robot():
     if stop_timer is not None:
         stop_timer.cancel()
     stop_motors()
-    for device in [*left_motors, *right_motors, sensor]:
-        if device is not None:
-            device.close()
+    for motor in left_motors + right_motors:
+        motor.close()
+    if gpio_handle is not None:
+        lgpio.gpiochip_close(gpio_handle)
 
 
 def robot_do(command, source):
