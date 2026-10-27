@@ -1,0 +1,7 @@
+Work Completed
+Robot baseline achieved. Motors can be controlled to move(forward, backward, front and back) via voice detection and gesture recognition
+Motors, voice detection and gesture recognition are merged into one coherent main code in Raspberry Pi 5 Thonny and runs properly. Further specific actions and detection measures to be added later on.
+
+Problems Faced 
+No proper power source to the L298N motor.
+Devices on top of body too cluttered and messy. High risk of devices to be in contact with running wheels.
