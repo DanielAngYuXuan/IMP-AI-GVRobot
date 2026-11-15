@@ -1,0 +1,713 @@
+"""
+robot_main.py - voice + gesture + follow-me control for the 4WD robot (Raspberry Pi 5 + AI Camera).
+
+Inputs (all feed the same robot_do() function):
+  * AI Camera (IMX500) pose estimation -> body gestures and the follow-me target
+  * USB microphone speech recognition  -> spoken commands
+
+Save this file in ~/picamera2-examples/examples/imx500/ and run it from Thonny on the Pi desktop.
+"""
+import ctypes
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import cv2
+import numpy as np
+import speech_recognition as sr
+import lgpio
+
+from picamera2 import CompletedRequest, MappedArray, Picamera2
+from picamera2.devices.imx500 import IMX500, NetworkIntrinsics
+from picamera2.devices.imx500.postprocess import COCODrawer
+from picamera2.devices.imx500.postprocess_highernet import postprocess_higherhrnet
+
+# ----------------------------------------------------------------------------
+# Hide the harmless ALSA warnings in Thonny's output
+# ----------------------------------------------------------------------------
+ERROR_HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                                 ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+
+
+def _silent(filename, line, function, err, fmt):
+    pass
+
+
+c_error_handler = ERROR_HANDLER(_silent)  # keep this reference alive, or Python frees it and crashes
+
+try:
+    ctypes.cdll.LoadLibrary("libasound.so.2").snd_lib_error_set_handler(c_error_handler)
+except OSError:
+    pass
+
+# ----------------------------------------------------------------------------
+# SETTINGS  (edit these)
+# ----------------------------------------------------------------------------
+MODEL = "/usr/share/imx500-models/imx500_network_higherhrnet_coco.rpk"
+DETECTION_THRESHOLD = 0.3   # pose detection confidence
+KP_MIN_SCORE = 0.3          # ignore keypoints the camera is unsure about
+MARGIN = 20                 # wrist must be this many pixels above the shoulder
+FRAMES_NEEDED = 3           # same gesture this many frames in a row to count
+ARM_OUT_RATIO = 0.8         # wrist must be this many shoulder-widths beyond the shoulder (sideways)
+ARM_LEVEL_RATIO = 0.7       # wrist must be within this many shoulder-widths of shoulder height
+MIN_SHOULDER_PX = 20        # ignore detections where the shoulders look unrealistically close
+SPEAK = True                # speak voice-command replies through the speaker
+WINDOW_SIZE_H_W = (480, 640)
+
+# --- Motors (GPIO numbers are BCM numbers, see the wiring table) ---
+USE_MOTORS = True           # set False to test voice, gestures and follow-me with nothing connected
+GPIO_CHIP = 15              # the "pinctrl-rp1" chip shown by the gpiodetect command
+PWM_FREQ = 200              # Hz, software PWM used for speed control
+# Two L298N modules, one motor per channel: module 1 = LEFT side, module 2 = RIGHT side
+FRONT_LEFT_PINS = (5, 6)       # module 1: IN1, IN2
+REAR_LEFT_PINS = (13, 19)      # module 1: IN3, IN4
+FRONT_RIGHT_PINS = (20, 21)    # module 2: IN1, IN2
+REAR_RIGHT_PINS = (16, 26)     # module 2: IN3, IN4
+
+SPEED = 0.6                 # speed for voice and gesture moves (0.0 - 1.0)
+MOVE_SECONDS = 1.0          # forward/backward runs this long, then stops by itself
+TURN_SECONDS = 0.4          # turns run this long, then stop by themselves
+
+# --- Follow-me ---
+FOLLOW_TARGET_PX = 130      # person's size in pixels at the distance you want (say "calibrate" to set it)
+TORSO_TO_SHOULDER = 0.75    # converts torso length to an equivalent shoulder width
+FOLLOW_MAX_SPEED = 0.5      # top forward speed while following (0.0 - 1.0)
+FOLLOW_MAX_TURN = 0.4       # top turning speed while following
+MIN_MOTOR_SPEED = 0.35      # the motors do not turn below roughly this value
+K_FORWARD = 1.2             # forward speed per unit of distance error
+K_TURN = 0.8                # turning speed per unit of sideways error
+DIST_DEADBAND = 0.15        # no forward movement when within 15% of the target size
+TURN_DEADBAND = 0.12        # no turning when you are within this fraction of the centre
+ALLOW_BACKUP = False        # True lets the robot reverse when you step too close
+SMOOTHING = 0.5             # 0..1, higher reacts faster but is more jittery
+MAX_JUMP_PX = 200           # ignore a person who "jumps" further than this between frames
+LOST_HOLD_S = 0.4           # keep the last command for this long after losing you
+LOST_GIVE_UP_S = 6.0        # leave follow mode after not seeing you for this long
+FOLLOW_WATCHDOG_S = 0.6     # stop the motors if no camera frame arrives for this long
+FOLLOW_DEBUG = True         # print what the follow controller is doing, twice a second
+
+# Spoken phrases: (robot command, spoken reply, phrases that trigger it).
+# Order matters: first match wins, so STOP is checked first for safety.
+VOICE_COMMANDS = [
+    ("STOP", "Stopping",
+     ("stop", "halt", "freeze", "stay")),
+    ("FOLLOW", "Following you",
+     ("follow me", "follow")),
+    ("CALIBRATE", "Distance saved",
+     ("set distance", "save distance", "remember distance", "keep this distance",
+      "set the distance", "save the distance", "this distance", "this far",
+      "hold distance", "mark distance", "lock distance", "set range", "save position",
+      "calibrate", "calibrated", "calibration", "calibrating", "caliber", "calibre",
+      "celebrate", "collaborate", "kalibrate")),
+    ("FORWARD", "Moving forward",
+     ("move front", "go front", "front", "move from", "move frond",
+      "forward", "go ahead", "move ahead", "foreword", "for word", "four word")),
+    ("BACKWARD", "Moving backward",
+     ("move back", "go back", "back", "backward", "reverse")),
+    ("TURN LEFT", "Turning left",
+     ("turn left", "go left", "left", "lift")),
+    ("TURN RIGHT", "Turning right",
+     ("turn right", "go right", "right", "write", "rite")),
+    ("STATUS", "System is running normally",
+     ("status", "report")),
+    ("HELLO", "Hello! The robot is ready",
+     ("hello", "hi robot")),
+]
+SHUTDOWN_PHRASES = ("shut down", "shutdown", "exit program")
+
+# Gesture -> robot command   ("left"/"right" always means YOUR left and right arm)
+GESTURE_COMMANDS = {
+    "ARMS OUT": "FORWARD",
+    "POINT LEFT": "TURN LEFT",
+    "POINT RIGHT": "TURN RIGHT",
+    "LEFT HAND UP": "TURN LEFT",
+    "RIGHT HAND UP": "TURN RIGHT",
+    "BOTH HANDS UP": "STOP",
+}
+
+# ----------------------------------------------------------------------------
+# SHARED STATE
+# ----------------------------------------------------------------------------
+action_lock = threading.Lock()
+stop_event = threading.Event()
+last_command = "none"
+
+left_motors = []     # front-left and rear-left
+right_motors = []    # front-right and rear-right
+gpio_handle = None
+stop_timer = None
+
+follow_active = False
+follow_cx = None            # smoothed sideways position of the person being followed
+follow_size = None          # smoothed size of that person
+follow_lost_since = None
+follow_last_update = 0.0
+follow_target = FOLLOW_TARGET_PX
+follow_text = ""
+latest_size = None          # size of the biggest person in the latest frame (used by "calibrate")
+latest_time = 0.0
+last_debug = 0.0
+
+
+# ----------------------------------------------------------------------------
+# MOTORS (lgpio, driven directly)
+# ----------------------------------------------------------------------------
+class Motor:
+    """One DC motor on two L298N input pins."""
+
+    def __init__(self, forward, backward):
+        self.fwd = forward
+        self.back = backward
+        lgpio.gpio_claim_output(gpio_handle, self.fwd, 0)
+        lgpio.gpio_claim_output(gpio_handle, self.back, 0)
+
+    def _set(self, fwd_duty, back_duty):
+        lgpio.tx_pwm(gpio_handle, self.fwd, PWM_FREQ, fwd_duty)
+        lgpio.tx_pwm(gpio_handle, self.back, PWM_FREQ, back_duty)
+
+    def forward(self, speed=1.0):
+        self._set(speed * 100, 0)
+
+    def backward(self, speed=1.0):
+        self._set(0, speed * 100)
+
+    def stop(self):
+        self._set(0, 0)
+
+    def close(self):
+        self.stop()
+        lgpio.gpio_free(gpio_handle, self.fwd)
+        lgpio.gpio_free(gpio_handle, self.back)
+
+
+def setup_robot():
+    global gpio_handle, left_motors, right_motors
+    gpio_handle = lgpio.gpiochip_open(GPIO_CHIP)
+    left_motors = [Motor(f, b) for f, b in (FRONT_LEFT_PINS, REAR_LEFT_PINS)]
+    right_motors = [Motor(f, b) for f, b in (FRONT_RIGHT_PINS, REAR_RIGHT_PINS)]
+
+
+def set_side(motors, direction):
+    """Fixed-speed drive for one side. direction: +1 forward, -1 backward, 0 stop."""
+    for motor in motors:
+        if direction > 0:
+            motor.forward(SPEED)
+        elif direction < 0:
+            motor.backward(SPEED)
+        else:
+            motor.stop()
+
+
+def set_side_speed(motors, value):
+    """Variable-speed drive for one side. value: -1.0 (full reverse) to +1.0 (full forward)."""
+    for motor in motors:
+        if value > 0:
+            motor.forward(value)
+        elif value < 0:
+            motor.backward(-value)
+        else:
+            motor.stop()
+
+
+def cancel_timer():
+    global stop_timer
+    if stop_timer is not None:
+        stop_timer.cancel()
+        stop_timer = None
+
+
+def stop_motors():
+    for motor in left_motors + right_motors:
+        motor.stop()
+
+
+def drive(left, right, seconds):
+    """Run the left/right sides (+1, -1 or 0), then stop by itself after `seconds`."""
+    global stop_timer
+    cancel_timer()
+    set_side(left_motors, left)
+    set_side(right_motors, right)
+    if seconds:
+        stop_timer = threading.Timer(seconds, stop_motors)
+        stop_timer.start()
+
+
+def drive_speeds(left, right):
+    """Continuous drive used by follow-me. No timer: the watchdog protects against stalls."""
+    set_side_speed(left_motors, left)
+    set_side_speed(right_motors, right)
+
+
+def shutdown_robot():
+    cancel_timer()
+    stop_motors()
+    for motor in left_motors + right_motors:
+        motor.close()
+    if gpio_handle is not None:
+        lgpio.gpiochip_close(gpio_handle)
+
+
+# ----------------------------------------------------------------------------
+# SHARED ROBOT ACTION  (voice, gestures and follow-me all end up here)
+# ----------------------------------------------------------------------------
+MOVE_COMMANDS = ("STOP", "FORWARD", "BACKWARD", "TURN LEFT", "TURN RIGHT")
+
+
+def robot_do(command, source):
+    global last_command
+    with action_lock:
+        if follow_active and source == "gesture" and command != "STOP":
+            return                      # while following, only the stop gesture is accepted
+
+        last_command = command
+        print(f"[{source.upper()}] -> {command}", flush=True)
+
+        if command == "FOLLOW":
+            start_follow()
+            return
+        if command == "CALIBRATE":
+            calibrate_distance()
+            return
+
+        if follow_active and command in MOVE_COMMANDS:
+            end_follow()                # a manual command takes over from follow mode
+
+        if not left_motors:             # motors not set up (USE_MOTORS = False)
+            return
+
+        if command == "STOP":
+            cancel_timer()
+            stop_motors()
+        elif command == "FORWARD":
+            drive(1, 1, MOVE_SECONDS)
+        elif command == "BACKWARD":
+            drive(-1, -1, MOVE_SECONDS)
+        elif command == "TURN LEFT":
+            drive(-1, 1, TURN_SECONDS)
+        elif command == "TURN RIGHT":
+            drive(1, -1, TURN_SECONDS)
+
+
+# ----------------------------------------------------------------------------
+# FOLLOW-ME
+# ----------------------------------------------------------------------------
+L_SHOULDER, R_SHOULDER = 5, 6
+L_WRIST, R_WRIST = 9, 10
+L_HIP, R_HIP = 11, 12
+
+
+def start_follow():
+    global follow_active, follow_cx, follow_size, follow_lost_since, follow_last_update
+    cancel_timer()
+    stop_motors()
+    follow_cx = None
+    follow_size = None
+    follow_lost_since = None
+    follow_last_update = time.time()
+    follow_active = True
+    print("[FOLLOW] on - locking onto the biggest person in view", flush=True)
+
+
+def end_follow():
+    global follow_active
+    follow_active = False
+    cancel_timer()
+    stop_motors()
+    print("[FOLLOW] off", flush=True)
+
+
+def calibrate_distance():
+    global follow_target
+    if latest_size is not None and time.time() - latest_time < 1.0:
+        follow_target = latest_size
+        print(f"[FOLLOW] distance saved: target size {follow_target:.0f} px", flush=True)
+    else:
+        print("[FOLLOW] cannot save the distance: no person in view", flush=True)
+
+
+def person_measure(kp):
+    """Return (sideways centre x, size in pixels) for one person, or None if not measurable."""
+    ls, rs = kp[L_SHOULDER], kp[R_SHOULDER]
+    if ls[2] < KP_MIN_SCORE or rs[2] < KP_MIN_SCORE:
+        return None
+    cx = (ls[0] + rs[0]) / 2
+    size = abs(ls[0] - rs[0])
+    lh, rh = kp[L_HIP], kp[R_HIP]
+    if lh[2] >= KP_MIN_SCORE and rh[2] >= KP_MIN_SCORE:
+        torso = (lh[1] + rh[1]) / 2 - (ls[1] + rs[1]) / 2
+        size = max(size, TORSO_TO_SHOULDER * torso)    # stays large when you turn sideways
+    if size < MIN_SHOULDER_PX:
+        return None
+    return cx, size
+
+
+def measure_all(keypoints):
+    if keypoints is None:
+        return []
+    measures = []
+    for kp in keypoints:
+        m = person_measure(kp)
+        if m is not None:
+            measures.append(m)
+    return measures
+
+
+def choose_target(measures):
+    if not measures:
+        return None
+    if follow_cx is None:
+        return max(measures, key=lambda m: m[1])           # first lock: the biggest person
+    nearest = min(measures, key=lambda m: abs(m[0] - follow_cx))
+    if abs(nearest[0] - follow_cx) > MAX_JUMP_PX:
+        return None
+    return nearest
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def apply_min_speed(value):
+    if abs(value) < 0.05:
+        return 0.0
+    if abs(value) < MIN_MOTOR_SPEED:
+        return MIN_MOTOR_SPEED if value > 0 else -MIN_MOTOR_SPEED
+    return value
+
+
+def follow_update(keypoints):
+    """Called for every camera frame while follow mode is on."""
+    global follow_cx, follow_size, follow_lost_since, follow_last_update, follow_text, last_debug
+    now = time.time()
+    with action_lock:
+        if not follow_active:
+            return
+        follow_last_update = now
+        target = choose_target(measure_all(keypoints))
+
+        if target is None:
+            if follow_lost_since is None:
+                follow_lost_since = now
+            lost_for = now - follow_lost_since
+            follow_text = f"Follow: searching {lost_for:.1f}s"
+            if lost_for > LOST_GIVE_UP_S:
+                end_follow()
+                print("[FOLLOW] lost you, follow mode off", flush=True)
+            elif lost_for > LOST_HOLD_S:
+                stop_motors()
+            return
+
+        follow_lost_since = None
+        cx, size = target
+        if follow_cx is None:
+            follow_cx, follow_size = cx, size
+        else:
+            follow_cx += SMOOTHING * (cx - follow_cx)
+            follow_size += SMOOTHING * (size - follow_size)
+
+        half_width = WINDOW_SIZE_H_W[1] / 2
+        side_error = (follow_cx - half_width) / half_width           # -1 (left) .. +1 (right)
+        dist_error = (follow_target - follow_size) / follow_target   # >0 too far, <0 too close
+
+        forward = 0.0
+        if dist_error > DIST_DEADBAND:
+            forward = min(K_FORWARD * dist_error, FOLLOW_MAX_SPEED)
+        elif dist_error < -DIST_DEADBAND and ALLOW_BACKUP:
+            forward = -min(K_FORWARD * -dist_error, FOLLOW_MAX_SPEED)
+
+        turn = 0.0
+        if abs(side_error) > TURN_DEADBAND:
+            turn = clamp(K_TURN * side_error, -FOLLOW_MAX_TURN, FOLLOW_MAX_TURN)
+
+        left = forward + turn
+        right = forward - turn
+        peak = max(abs(left), abs(right))
+        if peak > FOLLOW_MAX_SPEED:
+            left *= FOLLOW_MAX_SPEED / peak
+            right *= FOLLOW_MAX_SPEED / peak
+        left = apply_min_speed(left)
+        right = apply_min_speed(right)
+        drive_speeds(left, right)
+
+        follow_text = f"Follow: L {left:+.2f} R {right:+.2f}"
+        if FOLLOW_DEBUG and now - last_debug > 0.5:
+            last_debug = now
+            print(f"[FOLLOW] size {follow_size:.0f}/{follow_target:.0f}px "
+                  f"side {side_error:+.2f} -> L {left:+.2f} R {right:+.2f}", flush=True)
+
+
+def watchdog_check(now=None):
+    """Stops the motors if follow mode is on but camera frames have stopped arriving."""
+    now = time.time() if now is None else now
+    if follow_active and now - follow_last_update > FOLLOW_WATCHDOG_S:
+        with action_lock:
+            if follow_active and now - follow_last_update > FOLLOW_WATCHDOG_S:
+                stop_motors()
+                print("[FOLLOW] no camera frames, motors stopped", flush=True)
+                return True
+    return False
+
+
+def watchdog_loop():
+    while not stop_event.is_set():
+        watchdog_check()
+        time.sleep(0.1)
+
+
+# ----------------------------------------------------------------------------
+# GESTURE RECOGNITION (AI Camera)
+# ----------------------------------------------------------------------------
+last_boxes = None
+last_scores = None
+last_keypoints = None
+
+current_gesture = "none"
+candidate = "none"
+candidate_count = 0
+
+
+def arm_is_out(shoulder, wrist, center_x, shoulder_width):
+    """True if this arm is stretched out sideways at about shoulder height."""
+    if shoulder[2] < KP_MIN_SCORE or wrist[2] < KP_MIN_SCORE:
+        return False
+    shoulder_off = shoulder[0] - center_x
+    wrist_off = wrist[0] - center_x
+    same_side = shoulder_off * wrist_off > 0
+    far_out = abs(wrist_off) - abs(shoulder_off) > ARM_OUT_RATIO * shoulder_width
+    level = abs(wrist[1] - shoulder[1]) < ARM_LEVEL_RATIO * shoulder_width
+    return same_side and far_out and level
+
+
+def classify_gesture(kp):
+    """kp is 17 keypoints for one person, each (x, y, score)."""
+    ls, rs = kp[L_SHOULDER], kp[R_SHOULDER]
+    lw, rw = kp[L_WRIST], kp[R_WRIST]
+    left_up = lw[2] > KP_MIN_SCORE and ls[2] > KP_MIN_SCORE and lw[1] < ls[1] - MARGIN
+    right_up = rw[2] > KP_MIN_SCORE and rs[2] > KP_MIN_SCORE and rw[1] < rs[1] - MARGIN
+    if left_up and right_up:
+        return "BOTH HANDS UP"
+
+    if ls[2] > KP_MIN_SCORE and rs[2] > KP_MIN_SCORE:
+        shoulder_width = abs(ls[0] - rs[0])
+        if shoulder_width > MIN_SHOULDER_PX:
+            center_x = (ls[0] + rs[0]) / 2
+            left_out = arm_is_out(ls, lw, center_x, shoulder_width)
+            right_out = arm_is_out(rs, rw, center_x, shoulder_width)
+            if left_out and right_out:
+                return "ARMS OUT"
+            if left_out:
+                return "POINT LEFT"
+            if right_out:
+                return "POINT RIGHT"
+
+    if right_up:
+        return "RIGHT HAND UP"
+    if left_up:
+        return "LEFT HAND UP"
+    return "none"
+
+
+def update_gesture(raw):
+    """Accept a gesture only once it is stable, then trigger its robot command."""
+    global current_gesture, candidate, candidate_count
+    if raw == candidate:
+        candidate_count += 1
+    else:
+        candidate, candidate_count = raw, 1
+    if candidate_count >= FRAMES_NEEDED and candidate != current_gesture:
+        current_gesture = candidate
+        if current_gesture in GESTURE_COMMANDS:
+            robot_do(GESTURE_COMMANDS[current_gesture], "gesture")
+
+
+def ai_output_tensor_parse(metadata: dict):
+    global last_boxes, last_scores, last_keypoints
+    np_outputs = imx500.get_outputs(metadata=metadata, add_batch=True)
+    if np_outputs is not None:
+        keypoints, scores, boxes = postprocess_higherhrnet(
+            outputs=np_outputs,
+            img_size=WINDOW_SIZE_H_W,
+            img_w_pad=(0, 0),
+            img_h_pad=(0, 0),
+            detection_threshold=DETECTION_THRESHOLD,
+            network_postprocess=True,
+        )
+        if scores is not None and len(scores) > 0:
+            last_keypoints = np.reshape(np.stack(keypoints, axis=0), (len(scores), 17, 3))
+            last_boxes = [np.array(b) for b in boxes]
+            last_scores = np.array(scores)
+        else:
+            last_keypoints = None
+            last_boxes = None
+            last_scores = None
+    return last_boxes, last_scores, last_keypoints
+
+
+def ai_output_tensor_draw(request: CompletedRequest, boxes, scores, keypoints, stream='main'):
+    with MappedArray(request, stream) as m:
+        if boxes is not None and len(boxes) > 0:
+            drawer.annotate_image(
+                m.array, boxes, scores, np.zeros(scores.shape), keypoints,
+                DETECTION_THRESHOLD, DETECTION_THRESHOLD,
+                request.get_metadata(), picam2, stream,
+            )
+        cv2.putText(m.array, "Gesture: " + current_gesture, (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0, 255), 2)
+        cv2.putText(m.array, "Last command: " + last_command, (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255, 255), 2)
+        size_text = "Size: -" if latest_size is None else f"Size: {latest_size:.0f}"
+        cv2.putText(m.array, f"{size_text}  Target: {follow_target:.0f}", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0, 255), 2)
+        if follow_active:
+            cv2.putText(m.array, follow_text, (10, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 128, 0, 255), 2)
+
+
+def picamera2_pre_callback(request: CompletedRequest):
+    global latest_size, latest_time
+    boxes, scores, keypoints = ai_output_tensor_parse(request.get_metadata())
+
+    measures = measure_all(keypoints)
+    if measures:
+        latest_size = max(m[1] for m in measures)
+        latest_time = time.time()
+
+    if keypoints is not None and scores is not None:
+        best = int(np.argmax(scores))
+        update_gesture(classify_gesture(keypoints[best]))
+    else:
+        update_gesture("none")
+
+    if follow_active:
+        follow_update(keypoints)
+
+    ai_output_tensor_draw(request, boxes, scores, keypoints)
+
+
+def get_drawer():
+    categories = intrinsics.labels
+    categories = [c for c in categories if c and c != "-"]
+    return COCODrawer(categories, imx500, needs_rescale_coords=False)
+
+
+# ----------------------------------------------------------------------------
+# VOICE COMMANDS (USB microphone)
+# ----------------------------------------------------------------------------
+def speak(text):
+    if SPEAK:
+        subprocess.run(["espeak-ng", text])
+        time.sleep(0.7)
+
+
+def match_command(text):
+    text = text.lower()
+    for command, reply, phrases in VOICE_COMMANDS:
+        if any(p in text for p in phrases):
+            return command, reply
+    return None
+
+
+def handle_voice(alternatives):
+    """alternatives: possible transcripts of what was heard, best guess first."""
+    for text in alternatives:
+        if any(p in text.lower() for p in SHUTDOWN_PHRASES):
+            print("[VOICE] -> SHUTDOWN")
+            speak("Shutting down. Goodbye")
+            stop_event.set()
+            return
+    for text in alternatives:
+        match = match_command(text)
+        if match:
+            command, reply = match
+            robot_do(command, "voice")
+            speak(reply)
+            return
+    print("[VOICE] Command not recognised.")
+
+
+def voice_loop():
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
+    recognizer.pause_threshold = 0.6
+
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source, duration=2)
+    print("Voice ready. Try: 'follow me', 'set distance' (or 'calibrate'), 'move front', 'move back', "
+          "'turn left', 'turn right', 'stop' | say 'shut down' to quit")
+
+    while not stop_event.is_set():
+        with mic as source:
+            try:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+            except sr.WaitTimeoutError:
+                continue
+        try:
+            result = recognizer.recognize_google(audio, show_all=True)
+        except sr.UnknownValueError:
+            print("Could not understand, try again.")
+            continue
+        except sr.RequestError as e:
+            print("Speech service error (check internet):", e)
+            continue
+
+        alternatives = []
+        if isinstance(result, dict):
+            alternatives = [a["transcript"] for a in result.get("alternative", []) if "transcript" in a]
+        if not alternatives:
+            print("Could not understand, try again.")
+            continue
+
+        print("Heard:", alternatives[0], "| other guesses:", alternatives[1:4])
+        handle_voice(alternatives)
+
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    imx500 = IMX500(MODEL)
+    intrinsics = imx500.network_intrinsics
+    if not intrinsics:
+        intrinsics = NetworkIntrinsics()
+        intrinsics.task = "pose estimation"
+    elif intrinsics.task != "pose estimation":
+        print("Network is not a pose estimation task", file=sys.stderr)
+        sys.exit(1)
+
+    if intrinsics.inference_rate is None:
+        intrinsics.inference_rate = 10
+    if intrinsics.labels is None:
+        labels_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "coco_labels.txt")
+        with open(labels_path, "r") as f:
+            intrinsics.labels = f.read().splitlines()
+    intrinsics.update_with_defaults()
+
+    drawer = get_drawer()
+
+    picam2 = Picamera2(imx500.camera_num)
+    config = picam2.create_preview_configuration(
+        controls={'FrameRate': intrinsics.inference_rate}, buffer_count=12)
+
+    imx500.show_network_fw_progress_bar()
+    picam2.start(config, show_preview=True)
+    imx500.set_auto_aspect_ratio()
+    picam2.pre_callback = picamera2_pre_callback
+
+    if USE_MOTORS:
+        setup_robot()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=voice_loop, daemon=True).start()
+
+    print("Robot running. Press Thonny's Stop button or say 'shut down' to quit.")
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        shutdown_robot()
+        picam2.stop()
+        print("Stopped.")
