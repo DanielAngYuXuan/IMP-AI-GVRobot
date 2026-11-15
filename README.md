@@ -33,7 +33,9 @@ Voice and gestures both call one function, `robot_do()`, which drives the motors
 | move back | Backward |
 | turn left | Turn left |
 | turn right | Turn right |
-| stop | Stop |
+| stop | Stop, and ends follow mode |
+| follow me | Starts follow mode |
+| calibrate | Saves your current distance as the follow distance |
 | status, hello | Spoken reply only |
 | shut down | Quit the program |
 
@@ -156,6 +158,17 @@ Settings at the top of the script include `SPEED`, `MOVE_SECONDS`, `TURN_SECONDS
 - Speech recognition needs internet.
 - Gestures need your upper body in view, about 1.5 to 3 metres from the camera.
 
-## Next step
+## Follow-me mode
 
-Follow-me mode: steer from where the person is in the camera frame and use their size in the frame as a rough distance.
+Say "follow me". The robot locks onto the biggest person in view and keeps them centred and at a set distance.
+
+- Left and right position of the person in the frame steers the robot.
+- The person's size in the frame is used as a rough distance. Too small means too far, so the robot drives forward. Too big means too close, so it waits.
+- Stand at the distance you want, then say "calibrate" to save it. The size and target are shown on the camera preview.
+- Say "stop" or raise both hands to end follow mode. Any other spoken move command also takes over.
+- While following, only the both-hands-up gesture is accepted.
+- The robot stops if it loses you for about half a second, leaves follow mode after 6 seconds, and stops if camera frames stop arriving.
+
+Follow settings are at the top of `robot_main.py`: `FOLLOW_TARGET_PX`, `FOLLOW_MAX_SPEED`, `FOLLOW_MAX_TURN`, `MIN_MOTOR_SPEED`, `K_FORWARD`, `K_TURN` and the deadbands.
+
+To test without motors, set `USE_MOTORS = False`. The Shell then prints the wheel speeds the robot would use.
